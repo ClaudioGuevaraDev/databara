@@ -1,13 +1,5 @@
+import { qualifyName, quoteIdentifier } from "../../sqlIdentifiers";
 import type { DatabaseObjectDetails } from "../../types";
-
-function quoteIdentifier(identifier: string) {
-  if (/^[a-z_][a-z0-9_]*$/.test(identifier)) return identifier;
-  return `"${identifier.replace(/"/g, '""')}"`;
-}
-
-function qualifyName(schema: string, name: string) {
-  return `${quoteIdentifier(schema)}.${quoteIdentifier(name)}`;
-}
 
 function buildColumnSchema(
   column: DatabaseObjectDetails["columns"][number],

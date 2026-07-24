@@ -83,6 +83,7 @@ import {
   connectionDisplayName,
   connectionKey,
   copyText,
+  correctSqlFromHint,
   formatCommandMessage,
   isReadQuery,
   mergeExplorerTree,
@@ -1084,6 +1085,27 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setResultTab("results");
     patchTabResult(tabId, { state: "running", error: null, connectionId, baseSql });
 
+    // Runs a query derived from `sqlBase` and, when it fails because PostgreSQL folded
+    // an unquoted camelCase identifier to lowercase, re-runs it with that identifier
+    // quoted (using the server's own hint). Guarded to only act on case-only mismatches,
+    // so typos are never rewritten. Returns the corrected base SQL so the read path can
+    // page over the same corrected query.
+    const MAX_AUTOFIX = 20;
+    const runAutoCorrect = async (sqlBase: string, buildSql: (value: string) => string) => {
+      let current = sqlBase;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const execution = await runPostgresQuery(connectionId, buildSql(current));
+          return { execution, correctedSql: current };
+        } catch (error) {
+          const fixed =
+            attempt < MAX_AUTOFIX ? correctSqlFromHint(current, readErrorMessage(error)) : null;
+          if (!fixed || fixed === current) throw error;
+          current = fixed;
+        }
+      }
+    };
+
     try {
       if (isReadQuery(baseSql)) {
         // Pagination is always on for read queries. Page size = the user's own
@@ -1093,14 +1115,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         const pageSize = parsed?.pageSize ?? defaultRowLimit;
         const querySql = parsed?.baseSql ?? baseSql;
         const locked = parsed !== null;
-        const count = await runPostgresQuery(connectionId, buildCountSql(querySql));
+        const { execution: count, correctedSql } = await runAutoCorrect(querySql, buildCountSql);
         const totalRows = Number(count.rows[0]?.[0] ?? 0);
-        const ok = await executePage(tabId, connectionId, querySql, pageSize, 0, totalRows, locked);
+        // `correctedSql` (not `querySql`) becomes the tab's stored baseSql, so later
+        // page fetches run the same auto-quoted query.
+        const ok = await executePage(
+          tabId,
+          connectionId,
+          correctedSql,
+          pageSize,
+          0,
+          totalRows,
+          locked,
+        );
         if (ok) notify(translate("toast.runSummary", { rows: totalRows, pageSize }), "success");
       } else {
         // Non-read statements run as-is (no pagination). Returned rows (incl.
         // RETURNING) still show, plus the command result message.
-        const execution = await runPostgresQuery(connectionId, baseSql);
+        const { execution, correctedSql } = await runAutoCorrect(baseSql, (value) => value);
         const message = formatCommandMessage(
           execution.commandTag,
           execution.rowsAffected,
@@ -1110,11 +1142,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           state: "success",
           error: null,
           connectionId,
-          baseSql,
+          baseSql: correctedSql,
           pagination: null,
           result: {
             id: crypto.randomUUID(),
-            sql: baseSql,
+            sql: correctedSql,
             columns: execution.columns,
             columnTypes: execution.columnTypes,
             rows: execution.rows,

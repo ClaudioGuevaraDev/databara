@@ -1,6 +1,7 @@
 import type { Monaco } from "@monaco-editor/react";
 import type * as monacoEditor from "monaco-editor";
 import { translate } from "../i18n/translate";
+import { qualifyName, quoteIdentifier } from "../sqlIdentifiers";
 import type { DatabaseEngine, DatabaseObjectDetails } from "../types";
 
 type CompletionRange = {
@@ -686,10 +687,12 @@ function buildTableSuggestions(
   range: CompletionRange,
 ): monacoEditor.languages.CompletionItem[] {
   const qualifiedName = qualifyObjectName(selectedObject);
+  // Labels stay human-readable (unquoted); the inserted text is quoted so mixed-case
+  // identifiers are not folded to lowercase by PostgreSQL.
   return [
     {
       detail: `${selectedObject.kind} ${qualifiedName}`,
-      insertText: qualifiedName,
+      insertText: qualifyName(selectedObject.schema, selectedObject.name),
       kind: monaco.languages.CompletionItemKind.Struct,
       label: qualifiedName,
       range,
@@ -697,7 +700,7 @@ function buildTableSuggestions(
     },
     {
       detail: `${selectedObject.kind} ${qualifiedName}`,
-      insertText: selectedObject.name,
+      insertText: quoteIdentifier(selectedObject.name),
       kind: monaco.languages.CompletionItemKind.Struct,
       label: selectedObject.name,
       range,
@@ -713,7 +716,7 @@ function buildColumnSuggestions(
 ): monacoEditor.languages.CompletionItem[] {
   return selectedObject.columns.map((column) => ({
     detail: column.dataType,
-    insertText: column.name,
+    insertText: quoteIdentifier(column.name),
     kind: monaco.languages.CompletionItemKind.Field,
     label: column.name,
     range,

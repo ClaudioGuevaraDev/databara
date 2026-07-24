@@ -1,6 +1,7 @@
 import { connectionEngineLabel } from "../connectionEngines";
 import type { StoredConnectionDraft } from "../databaraService";
 import { translate } from "../i18n/translate";
+import { qualifyName, quoteIdentifier } from "../sqlIdentifiers";
 import type { ConnectionDraft, DatabaseEngine, DatabaseTreeNode } from "../types";
 import { savedConnectionNodeId } from "./workspaceCore";
 
@@ -150,6 +151,116 @@ export function readErrorMessage(error: unknown) {
   return translate("validation.unexpectedError");
 }
 
+/**
+ * Replaces whole-word, case-insensitive occurrences of a bare identifier with
+ * `replacement`, skipping regions where it must not be touched: single-quoted string
+ * literals, double-quoted identifiers, and `--` / block comments. Dollar-quoted strings
+ * are not handled (rare in ad-hoc queries); the retry re-validates against the server.
+ */
+function replaceUnquotedIdentifier(sql: string, identifier: string, replacement: string): string {
+  const target = identifier.toLowerCase();
+  const isWordChar = (ch: string) => /[A-Za-z0-9_$]/.test(ch);
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    // Single-quoted string literal ('' escapes a quote).
+    if (ch === "'") {
+      const start = i++;
+      while (i < sql.length) {
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          i++;
+          break;
+        }
+        i++;
+      }
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Double-quoted identifier ("" escapes a quote) — already quoted, leave untouched.
+    if (ch === '"') {
+      const start = i++;
+      while (i < sql.length) {
+        if (sql[i] === '"' && sql[i + 1] === '"') {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === '"') {
+          i++;
+          break;
+        }
+        i++;
+      }
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Line comment.
+    if (ch === "-" && next === "-") {
+      const start = i;
+      while (i < sql.length && sql[i] !== "\n") i++;
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Block comment.
+    if (ch === "/" && next === "*") {
+      const start = i;
+      i += 2;
+      while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+      i = Math.min(i + 2, sql.length);
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Word token (identifier / keyword).
+    if (isWordChar(ch)) {
+      const start = i;
+      while (i < sql.length && isWordChar(sql[i])) i++;
+      const word = sql.slice(start, i);
+      out += word.toLowerCase() === target ? replacement : word;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * When a query fails because PostgreSQL folded an unquoted identifier to lowercase
+ * (e.g. `companyId` → `companyid`), the server returns a hint naming the real object.
+ * This parses that hint and returns the SQL rewritten with the identifier quoted so the
+ * query can be retried. Returns `null` unless the mismatch is *purely* about case —
+ * so typos and genuinely different suggestions are never silently rewritten.
+ */
+export function correctSqlFromHint(sql: string, errorMessage: string): string | null {
+  const missing = errorMessage.match(/(?:column|relation) "([^"]+)" does not exist/i);
+  const hint = errorMessage.match(
+    /Perhaps you meant to reference the (?:column|table|relation) "([^"]+)"/i,
+  );
+  if (!missing || !hint) return null;
+
+  const wrong = missing[1];
+  // The suggestion may be qualified (e.g. `user.companyId`); the identifier we need to
+  // quote is the last dot-separated segment.
+  const suggestedParts = hint[1].split(".");
+  const suggested = suggestedParts[suggestedParts.length - 1] ?? "";
+  if (!suggested) return null;
+
+  // Guard: only act on a pure case-folding mismatch.
+  if (wrong.toLowerCase() !== suggested.toLowerCase()) return null;
+
+  const quoted = quoteIdentifier(suggested);
+  // Nothing to fix if the real name is already a plain lowercase identifier.
+  if (quoted === suggested) return null;
+
+  const rewritten = replaceUnquotedIdentifier(sql, suggested, quoted);
+  return rewritten === sql ? null : rewritten;
+}
+
 export function connectionDisplayName(
   draft: Pick<ConnectionDraft, "database" | "engine" | "host" | "port">,
 ) {
@@ -163,21 +274,21 @@ function parseDatabaseObjectId(objectId: string) {
   if (!schemaName || !objectName) return null;
 
   return {
+    name: objectName,
     qualifiedName: `${schemaName}.${objectName}`,
+    schema: schemaName,
   };
 }
 
 export function buildDefaultObjectSql(objectId: string, limit: number, engine: DatabaseEngine) {
   const object = parseDatabaseObjectId(objectId);
+  // Quote the identifier so mixed-case names are not folded to lowercase by the server.
+  const target = object ? qualifyName(object.schema, object.name) : null;
   // SQL Server uses `TOP n` instead of a trailing `LIMIT n`.
   if (engine === "mssql") {
-    return object
-      ? `SELECT TOP ${limit} * FROM ${object.qualifiedName};`
-      : `SELECT TOP ${limit} *;`;
+    return target ? `SELECT TOP ${limit} * FROM ${target};` : `SELECT TOP ${limit} *;`;
   }
-  return object
-    ? `SELECT * FROM ${object.qualifiedName} LIMIT ${limit};`
-    : `SELECT * LIMIT ${limit};`;
+  return target ? `SELECT * FROM ${target} LIMIT ${limit};` : `SELECT * LIMIT ${limit};`;
 }
 
 export function buildObjectTabLabel(objectId: string) {
