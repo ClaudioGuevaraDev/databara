@@ -44,9 +44,19 @@ El bundle de macOS necesita `icon.icns` y el de Linux necesita PNGs; hoy el repo
    git tag v0.10.1
    git push origin v0.10.1
    ```
-4. GitHub Actions construye los 3 SO y crea un **Release en borrador** con todos los instaladores.
-   Sigue el progreso en la pestaña **Actions** del repo.
-5. Cuando termine, ve a **Releases**, revisa el borrador, agrega notas de la versión y **publica**.
+4. GitHub Actions crea un release en borrador, construye los 3 SO subiendo cada bundle a ese mismo
+   borrador y, cuando los tres terminan, el job `publish-release` **lo publica solo**. Sigue el
+   progreso en la pestaña **Actions** del repo.
+5. Al terminar el workflow la versión **ya está publicada**: no hay paso manual, y el updater empieza
+   a ofrecerla a todo el que tenga la app instalada. Si quieres una ventana para revisar el borrador
+   antes de que salga, hay que quitar el job `publish-release` de
+   `.github/workflows/release.yml` (o condicionarlo, p. ej. a que el tag no lleve sufijo) y publicar a
+   mano desde **Releases**.
+
+> [!IMPORTANT]
+> Empujar el tag equivale a publicar. Todo lo que quieras comprobar en un build de release —
+> ejecutar la app, revisar los instaladores — hazlo **antes** del `git push origin vX.Y.Z`, con
+> `pnpm tauri build` en local.
 
 ### Artefactos generados
 
