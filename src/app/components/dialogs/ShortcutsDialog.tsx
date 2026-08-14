@@ -1,6 +1,7 @@
 import { Keyboard } from "lucide-react";
 import { useI18n } from "../../i18n/I18nContext";
 import type { TranslationKey } from "../../i18n/translate";
+import { tokenLabel } from "../../keyboardTokens";
 import { DialogBody, DialogCloseButton, DialogFrame, DialogHeader } from "../ui";
 
 // A key combination is a list of tokens. Modifier tokens ("Mod"/"Alt"/"Shift")
@@ -34,6 +35,7 @@ const GROUPS: ShortcutGroup[] = [
     items: [
       { labelKey: "shortcuts.nextPage", combos: [["Mod", "Alt", "↓"]] },
       { labelKey: "shortcuts.prevPage", combos: [["Mod", "Alt", "↑"]] },
+      { labelKey: "shortcuts.copyCells", combos: [["Mod", "C"]] },
       { labelKey: "shortcuts.copyResults", combos: [["Mod", "Shift", "C"]] },
     ],
   },
@@ -50,18 +52,6 @@ const GROUPS: ShortcutGroup[] = [
     ],
   },
 ];
-
-const isMac = /mac/i.test(
-  (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
-    navigator.platform,
-);
-
-function tokenLabel(token: string): string {
-  if (token === "Mod") return isMac ? "⌘" : "Ctrl";
-  if (token === "Alt") return isMac ? "⌥" : "Alt";
-  if (token === "Shift") return isMac ? "⇧" : "Shift";
-  return token;
-}
 
 export function ShortcutsDialog({ onClose }: { onClose: () => void }) {
   const { t } = useI18n();

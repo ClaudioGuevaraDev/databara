@@ -26,6 +26,8 @@ import { SchemaView } from "./SchemaView";
 export function ResultsPanel({
   activeTab,
   details,
+  onCopyCells,
+  onCopyJson,
   onCopySchema,
   onDownload,
   onPageChange,
@@ -40,6 +42,8 @@ export function ResultsPanel({
 }: {
   activeTab: ResultPanelTab;
   details: DatabaseObjectDetails | null;
+  onCopyCells: (text: string, cellCount: number) => void;
+  onCopyJson: () => void;
   onCopySchema: () => void;
   onDownload: (format: ResultExportFormat, scope: ResultExportScope) => void;
   onPageChange: (page: number) => void;
@@ -150,9 +154,9 @@ export function ResultsPanel({
           </pre>
         ) : hasGrid ? (
           viewMode === "json" ? (
-            <JsonView queryResult={queryResult} />
+            <JsonView queryResult={queryResult} onCopy={onCopyJson} />
           ) : (
-            <DataGrid queryResult={queryResult} />
+            <DataGrid queryResult={queryResult} onCopyCells={onCopyCells} />
           )
         ) : queryResult ? (
           <EmptyPanel text={queryResult.message} />

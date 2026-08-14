@@ -119,6 +119,8 @@ export type WorkspaceActions = {
   copyObjectName: () => Promise<void>;
   copySchema: () => Promise<void>;
   copyResult: () => Promise<void>;
+  copyJson: () => Promise<void>;
+  copyCells: (text: string, cellCount: number) => Promise<void>;
   deleteConnection: (nodeId: string) => void;
   openAddDatabase: (serverId: string) => void;
   openDownloadBackup: (connectionKey?: string) => void;
@@ -311,6 +313,8 @@ export function useResults() {
     closeResults: actions.closeResults,
     copySchema: actions.copySchema,
     copyResult: actions.copyResult,
+    copyJson: actions.copyJson,
+    copyCells: actions.copyCells,
     downloadResults: actions.downloadResults,
     goToQueryPage: actions.goToQueryPage,
     selectResultTab: actions.selectResultTab,

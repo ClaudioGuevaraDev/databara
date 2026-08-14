@@ -1313,6 +1313,27 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     notify(translate("toast.resultsCopied"), "success");
   }, [notify, queryResult]);
 
+  const copyJson = useCallback(async () => {
+    if (!queryResult) {
+      notify(translate("toast.runBeforeCopyResults"), "warning");
+      return;
+    }
+
+    await copyText(exportQueryResultJson(queryResult));
+    notify(translate("toast.resultsCopied"), "success");
+  }, [notify, queryResult]);
+
+  // Copies a block of cells the results grid already serialized as TSV; the
+  // grid owns the selection, the provider owns the clipboard + toast.
+  const copyCells = useCallback(
+    async (text: string, cellCount: number) => {
+      if (!text) return;
+      await copyText(text);
+      notify(translate("toast.cellsCopied", { count: cellCount }), "success");
+    },
+    [notify],
+  );
+
   const copySchema = useCallback(async () => {
     if (!selectedObject) {
       notify(translate("toast.selectObjectBeforeCopySchema"), "warning");
@@ -1777,6 +1798,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       copySchema,
       copyObjectName,
       copyResult,
+      copyJson,
+      copyCells,
       deleteConnection,
       openAddDatabase,
       openDownloadBackup,

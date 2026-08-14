@@ -1,6 +1,7 @@
-import type { ReactNode } from "react";
+import { Check, Copy } from "lucide-react";
+import { type ReactNode, useState } from "react";
 import { useI18n } from "../../i18n/I18nContext";
-import { coerceCell } from "../../query/coerceCell";
+import { exportQueryResultJson } from "../../query/exportJson";
 import type { QueryResult } from "../../types";
 import { EmptyPanel } from "../ui";
 
@@ -69,24 +70,38 @@ function renderJson(json: string) {
   return nodes;
 }
 
-export function JsonView({ queryResult }: { queryResult: QueryResult | null }) {
+export function JsonView({
+  queryResult,
+  onCopy,
+}: {
+  queryResult: QueryResult | null;
+  onCopy: () => void;
+}) {
   const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
   if (!queryResult || queryResult.columns.length === 0)
     return <EmptyPanel text={t("results.emptyGrid")} />;
 
-  const objects = queryResult.rows.map((row) =>
-    Object.fromEntries(
-      queryResult.columns.map((column, index) => [
-        column,
-        coerceCell(row[index], queryResult.columnTypes[index] ?? "string"),
-      ]),
-    ),
-  );
-  const json = JSON.stringify(objects, null, 2);
+  // Same serializer the JSON download uses, so both stay in sync.
+  const json = exportQueryResultJson(queryResult);
+
+  const handleCopy = () => {
+    onCopy();
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
 
   return (
     <div className="h-full overflow-auto bg-[hsl(var(--panel-soft)/0.2)] p-3">
-      <div className="min-h-full rounded-md border border-border/70 bg-[hsl(var(--panel-soft)/0.74)] shadow-[inset_0_1px_0_hsl(0_0%_100%/0.03),0_10px_24px_hsl(var(--shadow-strong)/0.18)]">
+      <div className="relative min-h-full rounded-md border border-border/70 bg-[hsl(var(--panel-soft)/0.74)] shadow-[inset_0_1px_0_hsl(0_0%_100%/0.03),0_10px_24px_hsl(var(--shadow-strong)/0.18)]">
+        <button
+          type="button"
+          onClick={handleCopy}
+          title={t("results.copyJson")}
+          className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
+        >
+          {copied ? <Check size={14} /> : <Copy size={14} />}
+        </button>
         <pre className="min-h-full overflow-auto p-3 font-mono text-[12px] leading-6 text-[hsl(215_20%_32%)] dark:text-[hsl(215_20%_78%)]">
           <code>{renderJson(json)}</code>
         </pre>
