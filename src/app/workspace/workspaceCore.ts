@@ -145,6 +145,7 @@ export type WorkspaceActions = {
   selectResultTab: (tab: ResultPanelTab) => void;
   selectResultViewMode: (mode: ResultViewMode) => void;
   selectSqlTab: (tabId: string) => void;
+  reorderSqlTabs: (tabId: string, toIndex: number) => void;
   setConnectionDialogOpen: (open: boolean) => void;
   setKeepConnectionsActive: (enabled: boolean) => void;
   setSettingsTab: (tab: SettingsTab) => void;
@@ -288,6 +289,7 @@ export function useSqlEditor() {
     sqlTabs: state.sqlTabs,
     closeSqlTab: actions.closeSqlTab,
     officializeSqlTab: actions.officializeSqlTab,
+    reorderSqlTabs: actions.reorderSqlTabs,
     runQuery: actions.runQuery,
     saveActiveSqlTab: actions.saveActiveSqlTab,
     selectSqlTab: actions.selectSqlTab,

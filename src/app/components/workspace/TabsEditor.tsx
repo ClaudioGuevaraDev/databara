@@ -71,6 +71,7 @@ export function TabsEditor() {
         activeTabId={editor.activeTabId}
         onClose={editor.closeSqlTab}
         onOfficialize={editor.officializeSqlTab}
+        onReorder={editor.reorderSqlTabs}
         onSelect={editor.selectSqlTab}
         tabs={editor.sqlTabs}
       />

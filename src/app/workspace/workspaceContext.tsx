@@ -1454,6 +1454,28 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [connectionByKey, sqlTabs, syncExplorerSelectionWithTab],
   );
 
+  // Drag-to-reorder in the tab strip. Addressed by id (not source index) because
+  // officializing a preview tab mid-gesture can merge it away and shift indexes.
+  const reorderSqlTabs = useCallback((tabId: string, toIndex: number) => {
+    const current = sqlTabsRef.current;
+    const fromIndex = current.findIndex((tab) => tab.id === tabId);
+    if (fromIndex === -1) return;
+
+    const target = Math.min(Math.max(toIndex, 0), current.length - 1);
+    if (target === fromIndex) return;
+
+    const next = [...current];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(target, 0, moved);
+    // Written off the ref rather than through a functional updater, and
+    // mirrored back into it exactly like `commitSqlTab` does: dropping a preview
+    // tab officializes it right after this call, and `commitSqlTab` reads the
+    // ref synchronously — a deferred updater would let it overwrite the new
+    // order with the pre-drag array.
+    sqlTabsRef.current = next;
+    setSqlTabs(next);
+  }, []);
+
   const closeSqlTab = useCallback(
     (tabId: string) => {
       const closingTabIndex = sqlTabs.findIndex((tab) => tab.id === tabId);
@@ -1792,6 +1814,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       selectResultTab: setResultTab,
       selectResultViewMode: setResultViewMode,
       selectSqlTab,
+      reorderSqlTabs,
       setConnectionDialogOpen,
       setKeepConnectionsActive: (enabled) => {
         setSettings((current) => ({ ...current, keepConnectionsActive: { enabled } }));
