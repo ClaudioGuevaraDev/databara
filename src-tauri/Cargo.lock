@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "databara"
-version = "1.41.3"
+version = "1.41.4"
 dependencies = [
  "chrono",
  "futures-util",

@@ -1,6 +1,6 @@
 [package]
 name = "databara"
-version = "1.41.3"
+version = "1.41.4"
 description = "A modern desktop database manager."
 authors = ["Databara"]
 edition = "2021"
