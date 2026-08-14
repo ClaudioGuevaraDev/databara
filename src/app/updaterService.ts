@@ -9,7 +9,7 @@ export type { Update };
 
 // Where users are sent when an in-app update can't be applied (e.g. Linux deb/rpm
 // or an AppImage in a non-writable location).
-export const DOWNLOAD_PAGE_URL = "https://databara.vercel.app/#download";
+export const DOWNLOAD_PAGE_URL = "https://www.databara.dev/#download";
 
 // GitHub releases API for the repo behind the updater endpoint. Used to surface
 // the latest *published* release version, which can differ from the bundled app
