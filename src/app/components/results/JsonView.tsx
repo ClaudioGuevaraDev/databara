@@ -1,5 +1,5 @@
 import { Check, Copy } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { useI18n } from "../../i18n/I18nContext";
 import { exportQueryResultJson } from "../../query/exportJson";
 import type { QueryResult } from "../../types";
@@ -79,11 +79,18 @@ export function JsonView({
 }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+  // Memoized because it's expensive and unrelated to most re-renders: the
+  // serializer walks every cell of the page, and the tokenizer then emits one
+  // element per JSON token. Without this it re-ran on every render — including
+  // every keystroke in the SQL editor while this view was open.
+  const nodes = useMemo(
+    // Same serializer the JSON download uses, so both stay in sync.
+    () => (queryResult ? renderJson(exportQueryResultJson(queryResult)) : null),
+    [queryResult],
+  );
+
   if (!queryResult || queryResult.columns.length === 0)
     return <EmptyPanel text={t("results.emptyGrid")} />;
-
-  // Same serializer the JSON download uses, so both stay in sync.
-  const json = exportQueryResultJson(queryResult);
 
   const handleCopy = () => {
     onCopy();
@@ -103,7 +110,7 @@ export function JsonView({
           {copied ? <Check size={14} /> : <Copy size={14} />}
         </button>
         <pre className="min-h-full overflow-auto p-3 font-mono text-[12px] leading-6 text-[hsl(215_20%_32%)] dark:text-[hsl(215_20%_78%)]">
-          <code>{renderJson(json)}</code>
+          <code>{nodes}</code>
         </pre>
       </div>
     </div>

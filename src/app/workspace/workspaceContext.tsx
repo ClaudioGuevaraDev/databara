@@ -65,13 +65,15 @@ import {
 } from "../updaterService";
 import {
   savedConnectionNodeId,
+  WorkspaceActionsContext,
   WorkspaceContext,
   type SettingsTab,
   type AddDatabaseRequest,
   type BackupRequest,
   type DeleteServerRequest,
   type RenameServerRequest,
-  type WorkspaceContextValue,
+  type WorkspaceActions,
+  type WorkspaceStateValue,
 } from "./workspaceCore";
 import {
   activeDatabaseNodeId,
@@ -99,7 +101,8 @@ import {
   createOfficialSqlTab,
   loadSqlTabsForConnection,
   officializeSqlTab,
-  saveSqlTabsForConnection,
+  serializeSqlTabsForConnection,
+  writeSqlTabsForConnection,
 } from "./workspaceSqlTabs";
 import { defaultDatabaseEngine, isFileEngine } from "../connectionEngines";
 
@@ -129,6 +132,45 @@ const defaultRowLimit = 50;
 // some startup step hangs.
 const SPLASH_MIN_DISPLAY_MS = 600;
 const SPLASH_TIMEOUT_MS = 10000;
+
+// Tab persistence is coalesced instead of running on every state change: writing
+// to localStorage is synchronous, and `sqlTabs` changes on every keystroke.
+const SQL_TABS_PERSIST_DEBOUNCE_MS = 500;
+
+// How many saved connections are reconnected at once on startup. Bounded so a
+// long list doesn't open dozens of sockets (and keychain reads) simultaneously.
+const STARTUP_RECONNECT_CONCURRENCY = 4;
+
+// How many times a query is re-run with an identifier quoted before giving up.
+const MAX_SQL_AUTOFIX_ATTEMPTS = 20;
+
+/**
+ * Runs a query derived from `sqlBase` and, when it fails because the server folded
+ * an unquoted camelCase identifier to lowercase, re-runs it with that identifier
+ * quoted (using the server's own hint). Guarded to only act on case-only
+ * mismatches, so typos are never rewritten. Returns the corrected base SQL so the
+ * caller can keep paging over the same corrected query.
+ */
+async function runQueryWithAutoCorrect(
+  connectionId: string,
+  sqlBase: string,
+  buildSql: (value: string) => string,
+) {
+  let current = sqlBase;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const execution = await runPostgresQuery(connectionId, buildSql(current));
+      return { correctedSql: current, execution };
+    } catch (error) {
+      const fixed =
+        attempt < MAX_SQL_AUTOFIX_ATTEMPTS
+          ? correctSqlFromHint(current, readErrorMessage(error))
+          : null;
+      if (!fixed || fixed === current) throw error;
+      current = fixed;
+    }
+  }
+}
 
 function getTabSelectionState(tab: SqlTab | null) {
   return {
@@ -205,9 +247,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const startupRevealedRef = useRef(false);
   const hasUnsavedTabsRef = useRef(false);
   const runningTabsRef = useRef<Set<string>>(new Set());
+  // Monotonic per-tab run counter, so a COUNT that resolves after the user re-ran
+  // the tab is discarded instead of overwriting the newer result's total.
+  const runTokensRef = useRef<Map<string, number>>(new Map());
   const toastCounterRef = useRef(0);
   const sqlTabsRef = useRef<SqlTab[]>([]);
   const activeTabIdRef = useRef("");
+  // Last payload written per connection key, so an unchanged payload is skipped.
+  const persistedSqlTabsRef = useRef<Map<string, string>>(new Map());
   // Read inside connectAndStoreConnection without making it depend on settings;
   // kept current by the settings effect below.
   const keepConnectionsActiveRef = useRef(settings.keepConnectionsActive.enabled);
@@ -445,12 +492,16 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return () => window.clearTimeout(timer);
   }, []);
 
-  // Reveal once the update check has settled and saved connections have finished
-  // reconnecting (`!autoReconnecting`), after the minimum splash time.
+  // Reveal once saved connections have finished reconnecting (`!autoReconnecting`),
+  // after the minimum splash time. Deliberately *not* gated on the update check:
+  // that's a request to GitHub, and waiting for it kept the splash up for as long
+  // as the network took (up to the safety timeout below) even though the workspace
+  // was ready. If an update turns out to be pending, the effect above opens its
+  // dialog over the already-visible window.
   useEffect(() => {
-    if (!updateCheckDone || autoReconnecting || !splashMinElapsed) return;
+    if (autoReconnecting || !splashMinElapsed) return;
     revealMainWindow();
-  }, [autoReconnecting, revealMainWindow, splashMinElapsed, updateCheckDone]);
+  }, [autoReconnecting, revealMainWindow, splashMinElapsed]);
 
   // Safety net: never leave the user stuck on the splash if some startup step
   // hangs (e.g. a connection that never resolves).
@@ -482,18 +533,21 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [connectionByKey, selectedObject],
   );
 
+  // The connection that owns the selected object, not the globally active one —
+  // they can differ in a multi-connection workspace. Resolved to a plain id so
+  // the effect below doesn't depend on the `connections` array identity, which
+  // changes on every connect (and made it re-issue its three queries each time).
+  const selectedObjectOwnerId = connections.some((item) => item.id === selectedObjectConnectionId)
+    ? selectedObjectConnectionId
+    : (activeConnection?.id ?? "");
+
   useEffect(() => {
     let cancelled = false;
 
     async function loadSelectedObject() {
-      if (!selectedObjectId) return;
-      // Load details from the connection that owns the selected object, not the
-      // globally active one — they can differ in a multi-connection workspace.
-      const connection =
-        connections.find((item) => item.id === selectedObjectConnectionId) ?? activeConnection;
-      if (!connection) return;
+      if (!selectedObjectId || !selectedObjectOwnerId) return;
       try {
-        const details = await getPostgresObjectDetails(connection.id, selectedObjectId);
+        const details = await getPostgresObjectDetails(selectedObjectOwnerId, selectedObjectId);
         if (!cancelled) {
           setSelectedObject(details);
           setCompletionObject(details);
@@ -511,7 +565,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [activeConnection, connections, notify, selectedObjectConnectionId, selectedObjectId]);
+  }, [notify, selectedObjectId, selectedObjectOwnerId]);
 
   useEffect(() => {
     hasUnsavedTabsRef.current = hasUnsavedTabs;
@@ -527,19 +581,36 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     activeTabIdRef.current = activeTabId;
   }, [activeTabId, sqlTabs]);
 
-  useEffect(() => {
-    // Tabs from all connected databases live in one array; persist each connection's
-    // own subset under its storage key (saveSqlTabsForConnection keeps activeTabId only
-    // when it belongs to that connection).
-    for (const connection of connections) {
+  // Tabs from all connected databases live in one array; each connection persists
+  // its own subset under its storage key (the serializer keeps activeTabId only
+  // when it belongs to that connection). Reads the refs so it can be scheduled
+  // and still see the latest tabs.
+  const flushSqlTabsPersistence = useCallback(() => {
+    for (const connection of connectionsRef.current) {
       const key = connectionKey(connection);
-      saveSqlTabsForConnection(
-        connection,
-        sqlTabs.filter((tab) => tab.connectionKey === key),
-        activeTabId,
+      const serialized = serializeSqlTabsForConnection(
+        sqlTabsRef.current.filter((tab) => tab.connectionKey === key),
+        activeTabIdRef.current,
       );
+      // Only *saved* SQL is persisted, so typing in a tab yields byte-identical
+      // JSON: skipping the write avoids a synchronous localStorage round-trip
+      // per connection per keystroke.
+      if (persistedSqlTabsRef.current.get(key) === serialized) continue;
+      persistedSqlTabsRef.current.set(key, serialized);
+      writeSqlTabsForConnection(connection, serialized);
     }
-  }, [activeTabId, connections, sqlTabs]);
+  }, []);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(flushSqlTabsPersistence, SQL_TABS_PERSIST_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeout);
+  }, [activeTabId, connections, flushSqlTabsPersistence, sqlTabs]);
+
+  // The debounce window can outlive the app (quit, reload), so flush on the way out.
+  useEffect(() => {
+    window.addEventListener("beforeunload", flushSqlTabsPersistence);
+    return () => window.removeEventListener("beforeunload", flushSqlTabsPersistence);
+  }, [flushSqlTabsPersistence]);
 
   useEffect(() => {
     function handleUnsavedTabsCloseRequest() {
@@ -591,8 +662,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (!currentTabId) return;
     const committedTab = commitSqlTab(currentTabId);
     if (!committedTab) return;
+    // An explicit save shouldn't wait out the persistence debounce (commitSqlTab
+    // already updated the refs the flush reads).
+    flushSqlTabsPersistence();
     notify(translate("toast.tabSaved", { label: committedTab.label }), "success");
-  }, [commitSqlTab, notify]);
+  }, [commitSqlTab, flushSqlTabsPersistence, notify]);
 
   const saveDirtySqlTabs = useCallback(async () => {
     const dirtyTabs = sqlTabsRef.current.filter((tab) => tab.dirty);
@@ -804,27 +878,58 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
     void (async () => {
       try {
-        for (const connection of storedConnections) {
-          try {
-            const password = await getConnectionPassword(connectionKey(connection));
-            // File engines (SQLite) have no stored password but can still reconnect.
-            if (password || isFileEngine(connection.engine)) {
-              await connectAndStoreConnection(
-                { ...connection, password: password ?? "" },
-                { skipOrchestration: true, announce: false },
+        const pending = storedConnections;
+        // Reconnect several at a time. Each entry is an independent keychain read
+        // plus a TCP/TLS handshake plus the catalog query, so doing them one after
+        // another made the splash wait for the *sum* of every connection's
+        // latency — and a single unreachable host blocked all the others until it
+        // timed out.
+        const reconnected = new Array<ConnectionProfile | null>(pending.length).fill(null);
+        let cursor = 0;
+        const reconnectWorker = async () => {
+          while (cursor < pending.length) {
+            const index = cursor;
+            cursor += 1;
+            const connection = pending[index];
+            try {
+              const password = await getConnectionPassword(connectionKey(connection));
+              // File engines (SQLite) have no stored password but can still reconnect.
+              if (password || isFileEngine(connection.engine)) {
+                // `silent` keeps focus and tab restoring out of the concurrent
+                // phase; both are applied below in list order so the end state
+                // doesn't depend on which connection happens to finish first.
+                const result = await connectCore(
+                  { ...connection, password: password ?? "" },
+                  { silent: true },
+                );
+                reconnected[index] = result.connection;
+              }
+            } catch (error) {
+              notify(
+                translate("toast.reconnectFailed", {
+                  database: connection.database,
+                  error: readErrorMessage(error),
+                }),
+                "warning",
               );
+            } finally {
+              setReconnectedCount((count) => count + 1);
             }
-          } catch (error) {
-            notify(
-              translate("toast.reconnectFailed", {
-                database: connection.database,
-                error: readErrorMessage(error),
-              }),
-              "warning",
-            );
-          } finally {
-            setReconnectedCount((count) => count + 1);
           }
+        };
+        await Promise.all(
+          Array.from({ length: Math.min(STARTUP_RECONNECT_CONCURRENCY, pending.length) }, () =>
+            reconnectWorker(),
+          ),
+        );
+
+        // Activate and restore tabs in the saved order, so the connection and tab
+        // left focused are the same ones the sequential version produced (the
+        // last saved connection that reconnected).
+        for (const profile of reconnected) {
+          if (!profile) continue;
+          setActiveConnectionId(profile.id);
+          loadConnectionSqlTabs(profile);
         }
       } finally {
         setAutoReconnecting(false);
@@ -834,8 +939,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       }
     })();
   }, [
-    connectAndStoreConnection,
+    connectCore,
     importAutoConnect,
+    loadConnectionSqlTabs,
     notify,
     settings.keepConnectionsActive.enabled,
     storedConnections,
@@ -995,7 +1101,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   );
 
   // Fetches a single page of a read query via SQL LIMIT/OFFSET and renders it into
-  // the given tab. `baseSql` must be normalized; `totalRows` comes from the COUNT run.
+  // the given tab. `baseSql` must be normalized; `totalRows` is null while the
+  // COUNT that produces the exact total is still in flight.
   const executePage = useCallback(
     async (
       tabId: string,
@@ -1003,7 +1110,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       baseSql: string,
       pageSize: number,
       page: number,
-      totalRows: number,
+      totalRows: number | null,
       pageSizeLocked: boolean,
     ) => {
       patchTabResult(tabId, { state: "running", error: null });
@@ -1011,38 +1118,75 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         const engine =
           connectionsRef.current.find((item) => item.id === connectionId)?.engine ??
           defaultDatabaseEngine;
-        const pageSql = buildPageSql(baseSql, pageSize, page, engine);
-        const execution = await runPostgresQuery(connectionId, pageSql);
+        const { correctedSql, execution } = await runQueryWithAutoCorrect(
+          connectionId,
+          baseSql,
+          (value) => buildPageSql(value, pageSize, page, engine),
+        );
         patchTabResult(tabId, {
           state: "success",
           error: null,
           connectionId,
-          baseSql,
+          baseSql: correctedSql,
           pagination: { page, pageSize, totalRows, pageSizeLocked },
           result: {
             id: crypto.randomUUID(),
-            sql: pageSql,
+            sql: buildPageSql(correctedSql, pageSize, page, engine),
             columns: execution.columns,
             columnTypes: execution.columnTypes,
             rows: execution.rows,
             durationMs: execution.durationMs,
             rowCount: execution.rowCount,
             message: translate("results.runSummary", {
-              rows: totalRows,
+              // Falls back to this page's own row count until the total is known.
+              rows: totalRows ?? execution.rowCount,
               pageSize,
               durationMs: execution.durationMs,
             }),
           },
         });
-        return true;
+        return { correctedSql, ok: true, rowCount: execution.rowCount };
       } catch (error) {
         const message = readErrorMessage(error);
         patchTabResult(tabId, { state: "error", error: message, result: null, pagination: null });
         notify(message, "warning");
-        return false;
+        return { correctedSql: baseSql, ok: false, rowCount: 0 };
       }
     },
     [notify, patchTabResult],
+  );
+
+  // Fills in the exact row total once the COUNT resolves (or once a short first page
+  // makes it known without one), and announces it. A result from a superseded run of
+  // the same tab is ignored, as is a total that is already known.
+  const applyTotalRows = useCallback(
+    (tabId: string, runToken: number, totalRows: number, pageSize: number) => {
+      if (runTokensRef.current.get(tabId) !== runToken) return;
+      setResultsByTab((previous) => {
+        const current = previous[tabId];
+        if (!current?.pagination || current.pagination.totalRows !== null) return previous;
+        return {
+          ...previous,
+          [tabId]: {
+            ...current,
+            pagination: { ...current.pagination, totalRows },
+            // Same result id on purpose: a new one would reset the cell selection.
+            result: current.result
+              ? {
+                  ...current.result,
+                  message: translate("results.runSummary", {
+                    rows: totalRows,
+                    pageSize,
+                    durationMs: current.result.durationMs,
+                  }),
+                }
+              : current.result,
+          },
+        };
+      });
+      notify(translate("toast.runSummary", { rows: totalRows, pageSize }), "success");
+    },
+    [notify],
   );
 
   const runQuery = useCallback(async () => {
@@ -1085,27 +1229,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setResultTab("results");
     patchTabResult(tabId, { state: "running", error: null, connectionId, baseSql });
 
-    // Runs a query derived from `sqlBase` and, when it fails because PostgreSQL folded
-    // an unquoted camelCase identifier to lowercase, re-runs it with that identifier
-    // quoted (using the server's own hint). Guarded to only act on case-only mismatches,
-    // so typos are never rewritten. Returns the corrected base SQL so the read path can
-    // page over the same corrected query.
-    const MAX_AUTOFIX = 20;
-    const runAutoCorrect = async (sqlBase: string, buildSql: (value: string) => string) => {
-      let current = sqlBase;
-      for (let attempt = 0; ; attempt++) {
-        try {
-          const execution = await runPostgresQuery(connectionId, buildSql(current));
-          return { execution, correctedSql: current };
-        } catch (error) {
-          const fixed =
-            attempt < MAX_AUTOFIX ? correctSqlFromHint(current, readErrorMessage(error)) : null;
-          if (!fixed || fixed === current) throw error;
-          current = fixed;
-        }
-      }
-    };
-
     try {
       if (isReadQuery(baseSql)) {
         // Pagination is always on for read queries. Page size = the user's own
@@ -1115,24 +1238,44 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         const pageSize = parsed?.pageSize ?? defaultRowLimit;
         const querySql = parsed?.baseSql ?? baseSql;
         const locked = parsed !== null;
-        const { execution: count, correctedSql } = await runAutoCorrect(querySql, buildCountSql);
-        const totalRows = Number(count.rows[0]?.[0] ?? 0);
-        // `correctedSql` (not `querySql`) becomes the tab's stored baseSql, so later
-        // page fetches run the same auto-quoted query.
-        const ok = await executePage(
-          tabId,
-          connectionId,
-          correctedSql,
-          pageSize,
-          0,
-          totalRows,
-          locked,
+
+        // The COUNT wraps the query as a subquery, so on a large table it scans the
+        // whole result set — it used to run *before* the first page, making every
+        // Run wait for it just to show 50 rows. Both now go out at once and the
+        // total fills in when it lands. The token keeps a late count from writing
+        // into a newer run of the same tab.
+        const runToken = (runTokensRef.current.get(tabId) ?? 0) + 1;
+        runTokensRef.current.set(tabId, runToken);
+        const countPromise = runQueryWithAutoCorrect(connectionId, querySql, buildCountSql).then(
+          ({ execution }) => Number(execution.rows[0]?.[0] ?? 0),
         );
-        if (ok) notify(translate("toast.runSummary", { rows: totalRows, pageSize }), "success");
+
+        const page = await executePage(tabId, connectionId, querySql, pageSize, 0, null, locked);
+        if (!page.ok) {
+          // The page already reported the failure; keep the count from surfacing as
+          // an unhandled rejection.
+          countPromise.catch(() => {});
+        } else if (page.rowCount < pageSize) {
+          // A first page shorter than the page size *is* the whole result, so the
+          // exact total is already known and the count is redundant.
+          countPromise.catch(() => {});
+          applyTotalRows(tabId, runToken, page.rowCount, pageSize);
+        } else {
+          void countPromise
+            .then((total) => applyTotalRows(tabId, runToken, total, pageSize))
+            .catch(() => {
+              // The rows are on screen already; a failed count only leaves page
+              // navigation disabled for this run.
+            });
+        }
       } else {
         // Non-read statements run as-is (no pagination). Returned rows (incl.
         // RETURNING) still show, plus the command result message.
-        const { execution, correctedSql } = await runAutoCorrect(baseSql, (value) => value);
+        const { correctedSql, execution } = await runQueryWithAutoCorrect(
+          connectionId,
+          baseSql,
+          (value) => value,
+        );
         const message = formatCommandMessage(
           execution.commandTag,
           execution.rowsAffected,
@@ -1167,6 +1310,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }, [
     activeConnection,
     activeTabId,
+    applyTotalRows,
     commitSqlTab,
     connectionByKey,
     executePage,
@@ -1183,6 +1327,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       if (runningTabsRef.current.has(tabId)) return;
 
       const { pageSize, totalRows, page: currentPage, pageSizeLocked } = current.pagination;
+      // Still counting: the page bounds aren't known yet (the footer disables the
+      // controls meanwhile).
+      if (totalRows === null) return;
       const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
       const target = Math.min(Math.max(page, 0), totalPages - 1);
       if (target === currentPage) return;
@@ -1212,6 +1359,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       if (!current || !current.pagination || pageSize === current.pagination.pageSize) return;
       // When the page size comes from the user's own LIMIT, the selector is locked.
       if (current.pagination.pageSizeLocked) return;
+      if (current.pagination.totalRows === null) return;
       if (runningTabsRef.current.has(tabId)) return;
 
       runningTabsRef.current.add(tabId);
@@ -1531,10 +1679,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         await saveDirtySqlTabs();
       }
 
+      // The window is about to close: don't leave a debounced write pending.
+      flushSqlTabsPersistence();
       setCloseWithUnsavedDialogOpen(false);
       await closeMainWindowAfterUnsavedResolution();
     },
-    [saveDirtySqlTabs],
+    [flushSqlTabsPersistence, saveDirtySqlTabs],
   );
 
   useEffect(() => {
@@ -1575,6 +1725,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         (tab) => !tab.connectionKey || !removeKeys.has(tab.connectionKey),
       );
       setSqlTabs(remainingTabs);
+      // Forget what was persisted for them, so re-adding a connection later
+      // writes its tabs again instead of matching a stale payload.
+      for (const key of removeKeys) persistedSqlTabsRef.current.delete(key);
 
       const wasActiveConnection =
         activeConnection && removeKeys.has(connectionKey(activeConnection));
@@ -1772,149 +1925,261 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const value: WorkspaceContextValue = {
-    actions: {
-      closeAddDatabaseDialog: () => setAddDatabaseRequest(null),
-      closeDeleteConnectionDialog: () => setDeleteConnectionRequest(null),
-      closeDeleteServerDialog: () => setDeleteServerRequest(null),
-      closeRenameServerDialog: () => setRenameServerRequest(null),
-      closePasswordDialog: () => setPasswordConnection(null),
-      closeResults: () => setResultsOpen(false),
-      closeSettingsDialog: () => setSettingsDialogOpen(false),
-      openShortcutsDialog: () => setShortcutsDialogOpen(true),
-      closeShortcutsDialog: () => setShortcutsDialogOpen(false),
-      openLoadConfigDialog: () => setLoadConfigDialogOpen(true),
-      closeLoadConfigDialog: () => setLoadConfigDialogOpen(false),
-      closeSqlTab,
-      closeUnsavedTabsDialog: () => setCloseWithUnsavedDialogOpen(false),
-      closeWindowAfterResolution,
-      confirmAddDatabase,
-      confirmDeleteConnection,
-      confirmDeleteServer,
-      confirmRenameServer,
-      confirmObjectTab,
-      connectStoredConnection,
-      setExplorerFilter,
-      copySchema,
-      copyObjectName,
-      copyResult,
-      copyJson,
-      copyCells,
-      deleteConnection,
-      openAddDatabase,
-      openDownloadBackup,
-      closeBackupDialog,
-      chooseBackupDirectory,
-      runBackup,
-      openDeleteServer,
-      openRenameServer,
-      downloadResults,
-      goToQueryPage,
-      openSchemaTab,
-      openNewConnectionDialog,
-      openSavedConnection,
-      openSettingsDialog: () => {
-        setSettingsTabState(rememberedSettingsTab);
-        setSettingsDialogOpen(true);
-      },
-      openStorageSettings: () => {
-        setSettingsTabState("storage");
-        setSettingsDialogOpen(true);
-      },
-      setSettingsTab: (tab: SettingsTab) => {
-        setSettingsTabState(tab);
-        setRememberedSettingsTab(tab);
-      },
-      officializeSqlTab: officializeSqlTabAction,
-      previewObject,
-      refreshAll,
-      refreshConnection,
-      runQuery,
-      saveActiveSqlTab,
-      setQueryPageSize,
-      saveConnection,
-      selectObject,
-      selectResultTab: setResultTab,
-      selectResultViewMode: setResultViewMode,
-      selectSqlTab,
-      reorderSqlTabs,
-      setConnectionDialogOpen,
-      setKeepConnectionsActive: (enabled) => {
-        setSettings((current) => ({ ...current, keepConnectionsActive: { enabled } }));
-        if (enabled) {
-          // Persist passwords of currently-live connections so they reconnect on startup.
-          connections.forEach((connection) => {
-            const key = connectionKey(connection);
-            const password = livePasswordsRef.current.get(key);
-            if (password) void storeConnectionPassword(key, password);
-          });
-        } else {
-          // Turning it off removes every stored password from the keychain.
-          storedConnections.forEach(
-            (connection) => void deleteConnectionPassword(connectionKey(connection)),
-          );
-        }
-      },
-      setActivateSiblingConnections: (enabled) =>
-        setSettings((current) => ({ ...current, activateSiblingConnections: { enabled } })),
-      setDiscoverServerDatabases: (enabled) =>
-        setSettings((current) => ({ ...current, discoverServerDatabases: { enabled } })),
-      setExportIncludesPasswords: (enabled) =>
-        setSettings((current) => ({ ...current, exportIncludesPasswords: { enabled } })),
-      exportConfiguration: (includePasswords) =>
-        buildConfigurationExport({
-          includePasswords,
-          livePasswords: Object.fromEntries(livePasswordsRef.current),
-        }),
-      notify,
-      setZoomLevel: (level) =>
-        setSettings((current) => ({
-          ...current,
-          zoom: { ...current.zoom, level: clampZoomLevel(level) },
-        })),
-      setEditorFontSize: (size) =>
-        setSettings((current) => ({
-          ...current,
-          editorFontSize: { size: clampEditorFontSize(size) },
-        })),
-      setNotificationPosition: (position) =>
-        setSettings((current) => ({
-          ...current,
-          notificationPosition: { position },
-        })),
-      setLanguage: (code) =>
-        setSettings((current) => ({
-          ...current,
-          language: { code },
-        })),
-      setThemePreference: (preference) =>
-        setSettings((current) => ({
-          ...current,
-          theme: { preference },
-        })),
-      setSidebarWidth: (width) =>
-        setSettings((current) => ({
-          ...current,
-          sidebarWidth: { width: clampSidebarWidth(width) },
-        })),
-      setBottomPanelHeight: (height) =>
-        setSettings((current) => ({
-          ...current,
-          bottomPanelHeight: { height: clampBottomPanelHeight(height) },
-        })),
-      resetSettings: () => setSettings(defaultAppSettings),
-      resetSettingsKeys: <K extends keyof AppSettings>(keys: K[]) =>
-        setSettings((current) => {
-          const next = { ...current };
-          for (const key of keys) next[key] = defaultAppSettings[key];
-          return next;
-        }),
-      startUpdateCheck,
-      dismissUpdateDialog,
-      openDownloadPage: () => void openDownloadPage(),
-      toggleNode,
-      updateActiveSql,
+  // Rebuilt every render (cheap: just closures). Consumers never see this object
+  // directly — they get the stable facade below, so a new closure here does not
+  // invalidate anything.
+  const actionsImpl: WorkspaceActions = {
+    closeAddDatabaseDialog: () => setAddDatabaseRequest(null),
+    closeDeleteConnectionDialog: () => setDeleteConnectionRequest(null),
+    closeDeleteServerDialog: () => setDeleteServerRequest(null),
+    closeRenameServerDialog: () => setRenameServerRequest(null),
+    closePasswordDialog: () => setPasswordConnection(null),
+    closeResults: () => setResultsOpen(false),
+    closeSettingsDialog: () => setSettingsDialogOpen(false),
+    openShortcutsDialog: () => setShortcutsDialogOpen(true),
+    closeShortcutsDialog: () => setShortcutsDialogOpen(false),
+    openLoadConfigDialog: () => setLoadConfigDialogOpen(true),
+    closeLoadConfigDialog: () => setLoadConfigDialogOpen(false),
+    closeSqlTab,
+    closeUnsavedTabsDialog: () => setCloseWithUnsavedDialogOpen(false),
+    closeWindowAfterResolution,
+    confirmAddDatabase,
+    confirmDeleteConnection,
+    confirmDeleteServer,
+    confirmRenameServer,
+    confirmObjectTab,
+    connectStoredConnection,
+    setExplorerFilter,
+    copySchema,
+    copyObjectName,
+    copyResult,
+    copyJson,
+    copyCells,
+    deleteConnection,
+    openAddDatabase,
+    openDownloadBackup,
+    closeBackupDialog,
+    chooseBackupDirectory,
+    runBackup,
+    openDeleteServer,
+    openRenameServer,
+    downloadResults,
+    goToQueryPage,
+    openSchemaTab,
+    openNewConnectionDialog,
+    openSavedConnection,
+    openSettingsDialog: () => {
+      setSettingsTabState(rememberedSettingsTab);
+      setSettingsDialogOpen(true);
     },
+    openStorageSettings: () => {
+      setSettingsTabState("storage");
+      setSettingsDialogOpen(true);
+    },
+    setSettingsTab: (tab: SettingsTab) => {
+      setSettingsTabState(tab);
+      setRememberedSettingsTab(tab);
+    },
+    officializeSqlTab: officializeSqlTabAction,
+    previewObject,
+    refreshAll,
+    refreshConnection,
+    runQuery,
+    saveActiveSqlTab,
+    setQueryPageSize,
+    saveConnection,
+    selectObject,
+    selectResultTab: setResultTab,
+    selectResultViewMode: setResultViewMode,
+    selectSqlTab,
+    reorderSqlTabs,
+    setConnectionDialogOpen,
+    setKeepConnectionsActive: (enabled) => {
+      setSettings((current) => ({ ...current, keepConnectionsActive: { enabled } }));
+      if (enabled) {
+        // Persist passwords of currently-live connections so they reconnect on startup.
+        connections.forEach((connection) => {
+          const key = connectionKey(connection);
+          const password = livePasswordsRef.current.get(key);
+          if (password) void storeConnectionPassword(key, password);
+        });
+      } else {
+        // Turning it off removes every stored password from the keychain.
+        storedConnections.forEach(
+          (connection) => void deleteConnectionPassword(connectionKey(connection)),
+        );
+      }
+    },
+    setActivateSiblingConnections: (enabled) =>
+      setSettings((current) => ({ ...current, activateSiblingConnections: { enabled } })),
+    setDiscoverServerDatabases: (enabled) =>
+      setSettings((current) => ({ ...current, discoverServerDatabases: { enabled } })),
+    setExportIncludesPasswords: (enabled) =>
+      setSettings((current) => ({ ...current, exportIncludesPasswords: { enabled } })),
+    exportConfiguration: (includePasswords) =>
+      buildConfigurationExport({
+        includePasswords,
+        livePasswords: Object.fromEntries(livePasswordsRef.current),
+      }),
+    notify,
+    setZoomLevel: (level) =>
+      setSettings((current) => ({
+        ...current,
+        zoom: { ...current.zoom, level: clampZoomLevel(level) },
+      })),
+    setEditorFontSize: (size) =>
+      setSettings((current) => ({
+        ...current,
+        editorFontSize: { size: clampEditorFontSize(size) },
+      })),
+    setNotificationPosition: (position) =>
+      setSettings((current) => ({
+        ...current,
+        notificationPosition: { position },
+      })),
+    setLanguage: (code) =>
+      setSettings((current) => ({
+        ...current,
+        language: { code },
+      })),
+    setThemePreference: (preference) =>
+      setSettings((current) => ({
+        ...current,
+        theme: { preference },
+      })),
+    setSidebarWidth: (width) =>
+      setSettings((current) => ({
+        ...current,
+        sidebarWidth: { width: clampSidebarWidth(width) },
+      })),
+    setBottomPanelHeight: (height) =>
+      setSettings((current) => ({
+        ...current,
+        bottomPanelHeight: { height: clampBottomPanelHeight(height) },
+      })),
+    resetSettings: () => setSettings(defaultAppSettings),
+    resetSettingsKeys: <K extends keyof AppSettings>(keys: K[]) =>
+      setSettings((current) => {
+        const next = { ...current };
+        for (const key of keys) next[key] = defaultAppSettings[key];
+        return next;
+      }),
+    startUpdateCheck,
+    dismissUpdateDialog,
+    openDownloadPage: () => void openDownloadPage(),
+    toggleNode,
+    updateActiveSql,
+  };
+
+  const latestActionsRef = useRef(actionsImpl);
+  // Refreshed after each commit; the forwarders below only read it when invoked
+  // (from event handlers), so they always call the latest implementations.
+  useEffect(() => {
+    latestActionsRef.current = actionsImpl;
+  });
+
+  // The actions exposed through context: one forwarder per action, created once.
+  // Their identities never change, which is what lets `React.memo`'d rows (the
+  // explorer tree, the results grid) skip re-rendering when unrelated state
+  // moves — without threading 76 `useCallback`s through a dependency array.
+  const actions = useMemo<WorkspaceActions>(
+    () => ({
+      closeAddDatabaseDialog: () => latestActionsRef.current.closeAddDatabaseDialog(),
+      closeDeleteConnectionDialog: () => latestActionsRef.current.closeDeleteConnectionDialog(),
+      closeDeleteServerDialog: () => latestActionsRef.current.closeDeleteServerDialog(),
+      closePasswordDialog: () => latestActionsRef.current.closePasswordDialog(),
+      closeRenameServerDialog: () => latestActionsRef.current.closeRenameServerDialog(),
+      closeSettingsDialog: () => latestActionsRef.current.closeSettingsDialog(),
+      openShortcutsDialog: () => latestActionsRef.current.openShortcutsDialog(),
+      closeShortcutsDialog: () => latestActionsRef.current.closeShortcutsDialog(),
+      openLoadConfigDialog: () => latestActionsRef.current.openLoadConfigDialog(),
+      closeLoadConfigDialog: () => latestActionsRef.current.closeLoadConfigDialog(),
+      closeResults: () => latestActionsRef.current.closeResults(),
+      closeSqlTab: (tabId) => latestActionsRef.current.closeSqlTab(tabId),
+      officializeSqlTab: (tabId) => latestActionsRef.current.officializeSqlTab(tabId),
+      closeUnsavedTabsDialog: () => latestActionsRef.current.closeUnsavedTabsDialog(),
+      closeWindowAfterResolution: (mode) =>
+        latestActionsRef.current.closeWindowAfterResolution(mode),
+      confirmAddDatabase: (serverId, database, password) =>
+        latestActionsRef.current.confirmAddDatabase(serverId, database, password),
+      confirmDeleteConnection: (connection) =>
+        latestActionsRef.current.confirmDeleteConnection(connection),
+      confirmDeleteServer: (serverId) => latestActionsRef.current.confirmDeleteServer(serverId),
+      confirmRenameServer: (serverId, name) =>
+        latestActionsRef.current.confirmRenameServer(serverId, name),
+      confirmObjectTab: (objectId, connectionKey) =>
+        latestActionsRef.current.confirmObjectTab(objectId, connectionKey),
+      connectStoredConnection: (connection, password) =>
+        latestActionsRef.current.connectStoredConnection(connection, password),
+      copyObjectName: () => latestActionsRef.current.copyObjectName(),
+      copySchema: () => latestActionsRef.current.copySchema(),
+      copyResult: () => latestActionsRef.current.copyResult(),
+      copyJson: () => latestActionsRef.current.copyJson(),
+      copyCells: (text, cellCount) => latestActionsRef.current.copyCells(text, cellCount),
+      deleteConnection: (nodeId) => latestActionsRef.current.deleteConnection(nodeId),
+      openAddDatabase: (serverId) => latestActionsRef.current.openAddDatabase(serverId),
+      openDownloadBackup: (connectionKey) =>
+        latestActionsRef.current.openDownloadBackup(connectionKey),
+      closeBackupDialog: () => latestActionsRef.current.closeBackupDialog(),
+      chooseBackupDirectory: () => latestActionsRef.current.chooseBackupDirectory(),
+      runBackup: (directory, fileName) => latestActionsRef.current.runBackup(directory, fileName),
+      openDeleteServer: (serverId) => latestActionsRef.current.openDeleteServer(serverId),
+      openRenameServer: (serverId) => latestActionsRef.current.openRenameServer(serverId),
+      downloadResults: (format, scope) => latestActionsRef.current.downloadResults(format, scope),
+      goToQueryPage: (page) => latestActionsRef.current.goToQueryPage(page),
+      openSchemaTab: () => latestActionsRef.current.openSchemaTab(),
+      openNewConnectionDialog: () => latestActionsRef.current.openNewConnectionDialog(),
+      openSavedConnection: (nodeId) => latestActionsRef.current.openSavedConnection(nodeId),
+      openSettingsDialog: () => latestActionsRef.current.openSettingsDialog(),
+      openStorageSettings: () => latestActionsRef.current.openStorageSettings(),
+      previewObject: (objectId) => latestActionsRef.current.previewObject(objectId),
+      refreshAll: () => latestActionsRef.current.refreshAll(),
+      refreshConnection: (connectionKey) =>
+        latestActionsRef.current.refreshConnection(connectionKey),
+      runQuery: () => latestActionsRef.current.runQuery(),
+      saveActiveSqlTab: () => latestActionsRef.current.saveActiveSqlTab(),
+      saveConnection: (draft) => latestActionsRef.current.saveConnection(draft),
+      selectObject: (objectId, connectionKey) =>
+        latestActionsRef.current.selectObject(objectId, connectionKey),
+      setExplorerFilter: (value) => latestActionsRef.current.setExplorerFilter(value),
+      selectResultTab: (tab) => latestActionsRef.current.selectResultTab(tab),
+      selectResultViewMode: (mode) => latestActionsRef.current.selectResultViewMode(mode),
+      selectSqlTab: (tabId) => latestActionsRef.current.selectSqlTab(tabId),
+      reorderSqlTabs: (tabId, toIndex) => latestActionsRef.current.reorderSqlTabs(tabId, toIndex),
+      setConnectionDialogOpen: (open) => latestActionsRef.current.setConnectionDialogOpen(open),
+      setKeepConnectionsActive: (enabled) =>
+        latestActionsRef.current.setKeepConnectionsActive(enabled),
+      setSettingsTab: (tab) => latestActionsRef.current.setSettingsTab(tab),
+      setActivateSiblingConnections: (enabled) =>
+        latestActionsRef.current.setActivateSiblingConnections(enabled),
+      setDiscoverServerDatabases: (enabled) =>
+        latestActionsRef.current.setDiscoverServerDatabases(enabled),
+      setExportIncludesPasswords: (enabled) =>
+        latestActionsRef.current.setExportIncludesPasswords(enabled),
+      exportConfiguration: (includePasswords) =>
+        latestActionsRef.current.exportConfiguration(includePasswords),
+      notify: (text, tone) => latestActionsRef.current.notify(text, tone),
+      setEditorFontSize: (size) => latestActionsRef.current.setEditorFontSize(size),
+      setNotificationPosition: (position) =>
+        latestActionsRef.current.setNotificationPosition(position),
+      setLanguage: (code) => latestActionsRef.current.setLanguage(code),
+      setThemePreference: (preference) => latestActionsRef.current.setThemePreference(preference),
+      setSidebarWidth: (width) => latestActionsRef.current.setSidebarWidth(width),
+      setBottomPanelHeight: (height) => latestActionsRef.current.setBottomPanelHeight(height),
+      resetSettings: () => latestActionsRef.current.resetSettings(),
+      resetSettingsKeys: (keys) => latestActionsRef.current.resetSettingsKeys(keys),
+      setQueryPageSize: (pageSize) => latestActionsRef.current.setQueryPageSize(pageSize),
+      setZoomLevel: (level) => latestActionsRef.current.setZoomLevel(level),
+      startUpdateCheck: (opts) => latestActionsRef.current.startUpdateCheck(opts),
+      dismissUpdateDialog: () => latestActionsRef.current.dismissUpdateDialog(),
+      openDownloadPage: () => latestActionsRef.current.openDownloadPage(),
+      toggleNode: (nodeId) => latestActionsRef.current.toggleNode(nodeId),
+      updateActiveSql: (sql) => latestActionsRef.current.updateActiveSql(sql),
+    }),
+    [],
+  );
+
+  const value: WorkspaceStateValue = {
     meta: {
       autoReconnecting,
       connectedConnectionKeys,
@@ -1965,5 +2230,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     },
   };
 
-  return <WorkspaceContext value={value}>{children}</WorkspaceContext>;
+  return (
+    <WorkspaceActionsContext value={actions}>
+      <WorkspaceContext value={value}>{children}</WorkspaceContext>
+    </WorkspaceActionsContext>
+  );
 }

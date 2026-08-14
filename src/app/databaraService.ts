@@ -892,19 +892,19 @@ function toBackendDraft(draft: ConnectionDraft): BackendConnectionDraft {
   return { ...draft };
 }
 
+// Every engine's `list_tree` returns a single server node at the root
+// (`server:{host}:{port}`), so only the top level needs the engine spliced into
+// its id. Recursing used to deep-copy the whole tree — thousands of objects per
+// connect and per refresh — while rewriting nothing below the root. Keeping the
+// subtrees by reference also preserves node identity across refreshes, which the
+// explorer's memoized flattening benefits from.
 function normalizeTreeForEngine(
   tree: DatabaseTreeNode[],
   engine: DatabaseEngine,
 ): DatabaseTreeNode[] {
-  return tree.map((node) => {
-    const id = node.id.startsWith("server:") ? `server:${engine}:${node.id.slice(7)}` : node.id;
-
-    return {
-      ...node,
-      id,
-      children: node.children ? normalizeTreeForEngine(node.children, engine) : node.children,
-    };
-  });
+  return tree.map((node) =>
+    node.id.startsWith("server:") ? { ...node, id: `server:${engine}:${node.id.slice(7)}` } : node,
+  );
 }
 
 function normalizeStoredConnection(connection: unknown): StoredConnectionDraft | null {

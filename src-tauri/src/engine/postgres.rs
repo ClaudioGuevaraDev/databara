@@ -206,9 +206,14 @@ pub async fn object_details(
     object_id: &str,
 ) -> Result<DatabaseObjectDetails, AppError> {
     let object = parse_object_id(object_id)?;
-    let columns = load_columns(client, &object).await?;
-    let indexes = load_indexes(client, &object).await?;
-    let row_count = estimate_row_count(client, &object).await?;
+    // The three queries are independent, and tokio-postgres pipelines concurrent
+    // requests over the same connection: awaiting them together costs one
+    // round-trip instead of three, which is what you feel on a remote database.
+    let (columns, indexes, row_count) = futures_util::try_join!(
+        load_columns(client, &object),
+        load_indexes(client, &object),
+        estimate_row_count(client, &object),
+    )?;
     let safe_edit = indexes.iter().any(|index| index.primary);
 
     Ok(DatabaseObjectDetails {
@@ -230,30 +235,34 @@ async fn load_columns(
 ) -> Result<Vec<ColumnDefinition>, AppError> {
     let rows = client
         .query(
+            // The index flags are resolved by aggregating pg_index once and
+            // joining, instead of two correlated `exists` subqueries that the
+            // planner had to re-run for every column of the table.
             "
+            with target as (
+              select c.oid
+              from pg_catalog.pg_class c
+              join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+              where n.nspname = $1
+                and c.relname = $2
+            ),
+            indexed_columns as (
+              select k.attnum, bool_or(i.indisprimary) as is_primary
+              from pg_catalog.pg_index i
+              join target t on t.oid = i.indrelid
+              cross join unnest(i.indkey) as k(attnum)
+              group by k.attnum
+            )
             select
               a.attname as column_name,
               pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
               not a.attnotnull as nullable,
-              exists (
-                select 1
-                from pg_catalog.pg_index i
-                where i.indrelid = c.oid
-                  and i.indisprimary
-                  and a.attnum = any(i.indkey)
-              ) as primary_key,
-              exists (
-                select 1
-                from pg_catalog.pg_index i
-                where i.indrelid = c.oid
-                  and a.attnum = any(i.indkey)
-              ) as indexed
+              coalesce(ic.is_primary, false) as primary_key,
+              ic.attnum is not null as indexed
             from pg_catalog.pg_attribute a
-            join pg_catalog.pg_class c on c.oid = a.attrelid
-            join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-            where n.nspname = $1
-              and c.relname = $2
-              and a.attnum > 0
+            join target t on t.oid = a.attrelid
+            left join indexed_columns ic on ic.attnum = a.attnum
+            where a.attnum > 0
               and not a.attisdropped
             order by a.attnum
             ",

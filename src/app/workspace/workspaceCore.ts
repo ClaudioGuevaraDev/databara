@@ -189,15 +189,41 @@ export type WorkspaceContextValue = {
   meta: WorkspaceMeta;
 };
 
-export const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
+// State and actions live in two separate contexts on purpose. `state`/`meta`
+// change on nearly every interaction (a keystroke in the editor rewrites
+// `sqlTabs`), while the actions object is a facade whose identity never
+// changes — see `createActionsFacade`. Hot, high-cardinality consumers (the
+// explorer rows) subscribe to the actions context only, so they can be
+// `React.memo`'d and skip the render entirely when unrelated state moves.
+export type WorkspaceStateValue = {
+  state: WorkspaceState;
+  meta: WorkspaceMeta;
+};
 
-export function useWorkspace() {
+export const WorkspaceContext = createContext<WorkspaceStateValue | null>(null);
+export const WorkspaceActionsContext = createContext<WorkspaceActions | null>(null);
+
+/**
+ * Subscribes to the workspace actions only. Prefer this in components that
+ * render once per tree node / grid row: it never invalidates on state changes.
+ */
+export function useWorkspaceActions() {
+  const actions = use(WorkspaceActionsContext);
+  if (!actions) {
+    throw new Error("useWorkspaceActions must be used within WorkspaceProvider");
+  }
+
+  return actions;
+}
+
+export function useWorkspace(): WorkspaceContextValue {
   const value = use(WorkspaceContext);
-  if (!value) {
+  const actions = use(WorkspaceActionsContext);
+  if (!value || !actions) {
     throw new Error("useWorkspace must be used within WorkspaceProvider");
   }
 
-  return value;
+  return { actions, meta: value.meta, state: value.state };
 }
 
 export function useWorkspaceLayout() {

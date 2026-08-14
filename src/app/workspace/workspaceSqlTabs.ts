@@ -171,11 +171,13 @@ export function loadSqlTabsForConnection(
   }
 }
 
-export function saveSqlTabsForConnection(
-  connection: Pick<ConnectionDraft, "database" | "engine" | "host" | "port" | "user">,
-  tabs: SqlTab[],
-  activeTabId: string,
-) {
+/**
+ * Serializes what a connection persists: only official tabs, and only their
+ * *saved* SQL. Split from the write so callers can compare the result with what
+ * they wrote last — unsaved edits don't change these bytes, so typing produces
+ * an identical payload and the write can be skipped entirely.
+ */
+export function serializeSqlTabsForConnection(tabs: SqlTab[], activeTabId: string): string {
   const officialTabs = tabs
     .filter((tab) => tab.state === "official")
     .map((tab) => ({
@@ -189,5 +191,12 @@ export function saveSqlTabsForConnection(
     tabs: officialTabs,
   };
 
-  window.localStorage.setItem(sqlTabsStorageKey(connection), JSON.stringify(persistedTabs));
+  return JSON.stringify(persistedTabs);
+}
+
+export function writeSqlTabsForConnection(
+  connection: Pick<ConnectionDraft, "database" | "engine" | "host" | "port" | "user">,
+  serializedTabs: string,
+) {
+  window.localStorage.setItem(sqlTabsStorageKey(connection), serializedTabs);
 }

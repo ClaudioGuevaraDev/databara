@@ -18,9 +18,18 @@ export function ResultsFooter({
 }) {
   const { t } = useI18n();
   const { page, pageSize, totalRows, pageSizeLocked } = pagination;
-  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-  const firstRow = totalRows === 0 ? 0 : page * pageSize + 1;
-  const lastRow = Math.min((page + 1) * pageSize, totalRows);
+  // The exact total comes from a COUNT that can scan the whole result set, so the
+  // rows are shown before it resolves. Until then the totals read as pending and
+  // the controls that need bounds stay disabled — for the fraction of a second it
+  // usually takes, or for as long as a big table needs.
+  const counting = totalRows === null;
+  const pending = "…";
+  const totalLabel = counting ? pending : totalRows.toLocaleString();
+  const totalPages = counting ? page + 1 : Math.max(1, Math.ceil(totalRows / pageSize));
+  const firstRow = !counting && totalRows === 0 ? 0 : page * pageSize + 1;
+  const lastRowLabel = counting
+    ? pending
+    : Math.min((page + 1) * pageSize, totalRows).toLocaleString();
   // The locked size (from the user's LIMIT) may not be one of the preset options.
   const sizeOptions = (QUERY_PAGE_SIZES as readonly number[]).includes(pageSize)
     ? QUERY_PAGE_SIZES
@@ -31,8 +40,7 @@ export function ResultsFooter({
       <div className="flex min-w-0 items-center gap-2">
         <span className="flex items-center gap-2 whitespace-nowrap">
           <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
-          <span className="tabular-nums text-foreground">{totalRows.toLocaleString()}</span>{" "}
-          {t("results.rowsWord")}
+          <span className="tabular-nums text-foreground">{totalLabel}</span> {t("results.rowsWord")}
         </span>
         <span className="text-border">·</span>
         <span className="whitespace-nowrap tabular-nums">
@@ -41,15 +49,15 @@ export function ResultsFooter({
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <span className="whitespace-nowrap">
-          {t("results.rowsWord")} {firstRow.toLocaleString()}–{lastRow.toLocaleString()}{" "}
-          {t("results.of")} <span className="text-foreground">{totalRows.toLocaleString()}</span>
+          {t("results.rowsWord")} {firstRow.toLocaleString()}–{lastRowLabel} {t("results.of")}{" "}
+          <span className="text-foreground">{totalLabel}</span>
         </span>
         <span className="text-border">·</span>
         <label className="flex items-center gap-1.5 whitespace-nowrap">
           {t("results.rowsLabel")}
           <select
             value={pageSize}
-            disabled={isRunning || pageSizeLocked}
+            disabled={isRunning || pageSizeLocked || counting}
             title={pageSizeLocked ? t("results.pageSizeLocked") : undefined}
             onChange={(event) => onPageSizeChange(Number(event.target.value))}
             className="h-7 rounded border border-border bg-background px-1.5 text-foreground disabled:cursor-not-allowed disabled:opacity-50"
@@ -70,11 +78,11 @@ export function ResultsFooter({
         </IconButton>
         <span className="whitespace-nowrap tabular-nums">
           {t("results.pageWord")} <span className="text-foreground">{page + 1}</span>{" "}
-          {t("results.of")} {totalPages}
+          {t("results.of")} {counting ? pending : totalPages}
         </span>
         <IconButton
           title={t("results.nextPage")}
-          disabled={isRunning || page >= totalPages - 1}
+          disabled={isRunning || counting || page >= totalPages - 1}
           onClick={() => onPageChange(page + 1)}
         >
           <ChevronRight size={16} />

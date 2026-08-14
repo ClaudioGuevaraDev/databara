@@ -58,6 +58,11 @@ export function ResultsPanel({
 }) {
   const { t } = useI18n();
   const { settings, setBottomPanelHeight } = useSettings();
+  // The scroller lives here (it is shared by every result view) but the grid needs
+  // it to virtualize its rows. Kept in state, not a ref: a child's layout effects
+  // run before React attaches the parent's ref, so a ref would still read null
+  // when the grid's virtualizer first looks for its scroll element.
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   // Live height while dragging; persisted only on release (see WorkspaceShell).
   const [dragHeight, setDragHeight] = useState<number | null>(null);
   const height = dragHeight ?? settings.bottomPanelHeight.height;
@@ -138,7 +143,7 @@ export function ResultsPanel({
       {showStatusLine ? (
         <ResultsStatusLine queryState={queryState} message={statusMessage} />
       ) : null}
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div ref={setScroller} className="min-h-0 flex-1 overflow-auto">
         {queryState === "running" ? (
           <div className="flex h-full items-center justify-center gap-2 text-muted-foreground">
             <Loader2 size={16} className="animate-spin text-primary" />
@@ -156,12 +161,12 @@ export function ResultsPanel({
           viewMode === "json" ? (
             <JsonView queryResult={queryResult} onCopy={onCopyJson} />
           ) : (
-            <DataGrid queryResult={queryResult} onCopyCells={onCopyCells} />
+            <DataGrid queryResult={queryResult} onCopyCells={onCopyCells} scroller={scroller} />
           )
         ) : queryResult ? (
           <EmptyPanel text={queryResult.message} />
         ) : (
-          <DataGrid queryResult={null} />
+          <DataGrid queryResult={null} scroller={scroller} />
         )}
       </div>
       {activeTab === "results" && queryPagination ? (

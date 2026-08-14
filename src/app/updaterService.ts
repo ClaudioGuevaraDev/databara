@@ -51,11 +51,15 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+// Bounds the release-manifest request. Without it a hanging network leaves the
+// check pending indefinitely, which used to hold up the whole startup.
+const UPDATE_CHECK_TIMEOUT_MS = 8000;
+
 // Returns the pending update, or null when up to date / running outside the
 // desktop app (e.g. `pnpm run dev` in a browser, where the plugin is absent).
 export async function checkForUpdate(): Promise<Update | null> {
   if (!isTauriRuntime()) return null;
-  return check();
+  return check({ timeout: UPDATE_CHECK_TIMEOUT_MS });
 }
 
 // Downloads and installs the update, reporting cumulative download progress.

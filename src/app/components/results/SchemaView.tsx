@@ -1,5 +1,5 @@
 import { Check, Copy } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { useI18n } from "../../i18n/I18nContext";
 import type { DatabaseObjectDetails } from "../../types";
 import { EmptyPanel } from "../ui";
@@ -51,7 +51,9 @@ function renderSql(sql: string) {
     }
 
     return (
-      <div key={`${lineIndex}-${line}`} className="whitespace-pre">
+      // Keyed by position only: including the line text remounted every line
+      // whose content changed.
+      <div key={lineIndex} className="whitespace-pre">
         {renderedTokens.length > 0 ? renderedTokens : <span>&nbsp;</span>}
       </div>
     );
@@ -143,9 +145,13 @@ export function SchemaView({
 }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+  // The schema build + tokenizer used to re-run on every render; both depend
+  // only on `details`.
+  const schemaSql = useMemo(() => (details ? buildObjectSchema(details) : ""), [details]);
+  const schemaNodes = useMemo(() => renderSql(schemaSql), [schemaSql]);
+
   if (!details) return <EmptyPanel text={t("results.emptySchema")} />;
 
-  const schemaSql = buildObjectSchema(details);
   const badgeSurfaceClass = "bg-[hsl(var(--panel-soft)/0.74)]";
 
   const handleCopy = () => {
@@ -168,7 +174,7 @@ export function SchemaView({
           {copied ? <Check size={14} /> : <Copy size={14} />}
         </button>
         <pre className="min-h-full overflow-auto p-3 font-mono text-[12px] leading-6">
-          <code>{renderSql(schemaSql)}</code>
+          <code>{schemaNodes}</code>
         </pre>
       </div>
     </div>

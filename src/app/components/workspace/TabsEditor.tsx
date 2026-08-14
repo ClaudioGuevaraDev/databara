@@ -1,12 +1,50 @@
-import Editor, { type Monaco, type OnMount } from "@monaco-editor/react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { defineDatabaraTheme, resolveEditorTheme } from "../../editor/databaraTheme";
+import { type EditorProps, type Monaco, type OnMount } from "@monaco-editor/react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { resolveEditorTheme } from "../../editor/databaraTheme";
 import { registerSqlCompletionProvider } from "../../editor/sqlCompletion";
 import type { DatabaseObjectDetails } from "../../types";
 import { useSettings, useSqlEditor } from "../../workspace/workspaceCore";
 import { EditorTabs } from "./EditorTabs";
 import { EmptyEditor } from "./EmptyEditor";
 import { QueryToolbar } from "./QueryToolbar";
+
+// Monaco and its editor contributions are ~3.6 MB: loaded as a separate chunk so
+// the workspace paints without waiting for them to be parsed.
+const MonacoSqlEditor = lazy(() => import("./MonacoSqlEditor"));
+
+// Same blank surface Monaco itself shows while it initialises, so the hand-off
+// between the chunk loading and the editor mounting isn't visible.
+const editorFallback = <div className="h-full w-full bg-background" />;
+
+// Hoisted: an inline object literal makes the wrapper call
+// `editor.updateOptions(...)` on every render — i.e. on every keystroke, since
+// typing updates workspace state — which re-validates every option.
+const BASE_EDITOR_OPTIONS: NonNullable<EditorProps["options"]> = {
+  automaticLayout: true,
+  bracketPairColorization: { enabled: true },
+  contextmenu: false,
+  cursorBlinking: "smooth",
+  cursorSmoothCaretAnimation: "on",
+  fontFamily: "JetBrains Mono, Cascadia Code, Consolas, monospace",
+  fontLigatures: true,
+  glyphMargin: false,
+  guides: { bracketPairs: "active", indentation: true },
+  lineNumbersMinChars: 3,
+  minimap: { enabled: false },
+  overviewRulerBorder: false,
+  overviewRulerLanes: 0,
+  padding: { bottom: 18, top: 18 },
+  renderLineHighlight: "all",
+  roundedSelection: true,
+  scrollBeyondLastLine: false,
+  scrollbar: {
+    horizontalScrollbarSize: 14,
+    useShadows: false,
+    verticalScrollbarSize: 14,
+  },
+  smoothScrolling: true,
+  wordWrap: "on",
+};
 
 export function TabsEditor() {
   const editor = useSqlEditor();
@@ -32,9 +70,19 @@ export function TabsEditor() {
   const selectedObjectRef = useRef<DatabaseObjectDetails | null>(editor.completionObject);
   const runQueryRef = useRef(editor.runQuery);
   const saveActiveSqlTabRef = useRef(editor.saveActiveSqlTab);
+  const monacoRef = useRef<Monaco | null>(null);
   const completionProviderRef = useRef<ReturnType<
     Monaco["languages"]["registerCompletionItemProvider"]
   > | null>(null);
+
+  const editorOptions = useMemo(
+    () => ({
+      ...BASE_EDITOR_OPTIONS,
+      fontSize: editorFontSize,
+      lineHeight: Math.round(editorFontSize * 1.6),
+    }),
+    [editorFontSize],
+  );
 
   useEffect(() => {
     selectedObjectRef.current = editor.completionObject;
@@ -52,6 +100,7 @@ export function TabsEditor() {
   }, []);
 
   const handleEditorMount = useCallback<OnMount>((monacoEditor, monaco) => {
+    monacoRef.current = monaco;
     completionProviderRef.current?.dispose();
     completionProviderRef.current = registerSqlCompletionProvider(monaco, () => ({
       selectedObject: selectedObjectRef.current,
@@ -64,6 +113,29 @@ export function TabsEditor() {
       void saveActiveSqlTabRef.current();
     });
   }, []);
+
+  const { updateActiveSql } = editor;
+  const handleChange = useCallback(
+    (value: string | undefined) => {
+      updateActiveSql(value ?? "");
+    },
+    [updateActiveSql],
+  );
+
+  // One model per tab (see the `path` prop) means a closed tab's model would
+  // otherwise stay in Monaco's registry for the rest of the session: the wrapper
+  // only ever disposes the one currently attached.
+  const openTabIds = editor.sqlTabs.map((tab) => tab.id).join("\n");
+  useEffect(() => {
+    const monaco = monacoRef.current;
+    if (!monaco) return;
+    const openUris = new Set(
+      openTabIds ? openTabIds.split("\n").map((id) => monaco.Uri.parse(id).toString()) : [],
+    );
+    for (const model of monaco.editor.getModels()) {
+      if (!openUris.has(model.uri.toString())) model.dispose();
+    }
+  }, [openTabIds]);
 
   return (
     <>
@@ -85,44 +157,16 @@ export function TabsEditor() {
       />
       <section className="min-h-0 flex-1 bg-background">
         {editor.activeTab ? (
-          <Editor
-            key={editor.activeTab.id}
-            defaultLanguage="sql"
-            loading={<div className="h-full w-full bg-background" />}
-            value={editor.activeTab.sql}
-            theme={editorTheme}
-            beforeMount={defineDatabaraTheme}
-            onChange={(value) => editor.updateActiveSql(value ?? "")}
-            onMount={handleEditorMount}
-            options={{
-              automaticLayout: true,
-              bracketPairColorization: { enabled: true },
-              contextmenu: false,
-              cursorBlinking: "smooth",
-              cursorSmoothCaretAnimation: "on",
-              fontFamily: "JetBrains Mono, Cascadia Code, Consolas, monospace",
-              fontLigatures: true,
-              fontSize: editorFontSize,
-              glyphMargin: false,
-              guides: { bracketPairs: "active", indentation: true },
-              lineHeight: Math.round(editorFontSize * 1.6),
-              lineNumbersMinChars: 3,
-              minimap: { enabled: false },
-              overviewRulerBorder: false,
-              overviewRulerLanes: 0,
-              padding: { bottom: 18, top: 18 },
-              renderLineHighlight: "all",
-              roundedSelection: true,
-              scrollBeyondLastLine: false,
-              scrollbar: {
-                horizontalScrollbarSize: 14,
-                useShadows: false,
-                verticalScrollbarSize: 14,
-              },
-              smoothScrolling: true,
-              wordWrap: "on",
-            }}
-          />
+          <Suspense fallback={editorFallback}>
+            <MonacoSqlEditor
+              path={editor.activeTab.id}
+              value={editor.activeTab.sql}
+              theme={editorTheme}
+              onChange={handleChange}
+              onMount={handleEditorMount}
+              options={editorOptions}
+            />
+          </Suspense>
         ) : (
           <EmptyEditor />
         )}

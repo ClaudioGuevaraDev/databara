@@ -136,7 +136,9 @@ export const QUERY_PAGE_SIZES = [50, 100, 200, 500] as const;
 export type QueryPagination = {
   page: number; // 0-based
   pageSize: number;
-  totalRows: number;
+  // null while the COUNT that produces the exact total is still running: the rows
+  // of the first page are rendered without waiting for it.
+  totalRows: number | null;
   // true when the page size comes from the user's own LIMIT (selector is locked)
   pageSizeLocked: boolean;
 };

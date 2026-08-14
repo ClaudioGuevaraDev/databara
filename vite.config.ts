@@ -14,7 +14,11 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
-    target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
+    // Bumped from the Tauri template's `safari13`: that target made esbuild
+    // downlevel optional chaining, nullish coalescing and `async`/`await` across
+    // the whole bundle, Monaco's 3.7 MB included. Safari 14 ships on macOS 10.15,
+    // which is Tauri v2's minimum, so nothing supported is left behind.
+    target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari14",
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
     rollupOptions: {
